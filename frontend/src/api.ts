@@ -32,6 +32,8 @@ export type Photo = {
   accept_unresolved: boolean;
 };
 
+export type Wrinkles = "off" | "straighten" | "clean";
+
 export type Analysis = { scale: number; offset_x: number; offset_y: number; width: number; height: number };
 
 export type Project = {
@@ -42,6 +44,11 @@ export type Project = {
   crop: Rect | null;
   output_width: number | null;
   blanket_polygon: Pt[] | null;
+  perspective: boolean;
+  blanket_quad: Pt[] | null;
+  blanket_aspect: number | null;
+  estimated_aspect: number | null;
+  wrinkles: Wrinkles;
   photos: Photo[];
   job: { state: "idle" | "queued" | "running"; done: number; total: number; message: string; error: string | null };
   analysis?: Analysis;
@@ -100,7 +107,7 @@ export const api = {
   listProjects: () => request<ProjectSummary[]>("GET", "/api/projects"),
   createProject: (name: string) => request<Project>("POST", "/api/projects", { name }),
   getProject: (id: string) => request<Project>("GET", P(id)),
-  updateProject: (id: string, body: Partial<Pick<Project, "name" | "crop" | "output_width" | "blanket_polygon">>) =>
+  updateProject: (id: string, body: Partial<Pick<Project, "name" | "crop" | "output_width" | "blanket_polygon" | "perspective" | "blanket_quad" | "blanket_aspect" | "wrinkles">>) =>
     request<Project>("PATCH", P(id), body),
   deleteProject: (id: string) => request<void>("DELETE", P(id)),
   setReference: (id: string, photo_id: string) => request<Project>("POST", `${P(id)}/reference`, { photo_id }),

@@ -41,6 +41,19 @@ def camera(dx: float = 0, dy: float = 0, rot_deg: float = 0, scale: float = 1.2,
     return t2 @ p @ r @ t1
 
 
+def wrinkle(texture: np.ndarray, amp: float, phase: float, wavelength: float = 260.0, crease: float = 0.0) -> np.ndarray:
+    """Smoothly displace the blanket print (wrinkles) and optionally darken a diagonal crease band."""
+    h, w = texture.shape[:2]
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    mx = xs + amp * np.sin(2 * np.pi * ys / wavelength + phase)
+    my = ys + amp * np.sin(2 * np.pi * xs / wavelength + phase + 1.3)
+    out = cv2.remap(texture, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    if crease:
+        band = np.exp(-(((xs - ys * 0.8 - 200 - 150 * phase) / 25.0) ** 2))
+        out = np.clip(out * (1 - crease * band[..., None]), 0, 255).astype(np.uint8)
+    return out
+
+
 def render_scene(texture: np.ndarray, g: np.ndarray, seed: int, baby_at=(0.5, 0.5), gain=(1.0, 1.0, 1.0)) -> np.ndarray:
     tex = texture.copy()
     if baby_at is not None:

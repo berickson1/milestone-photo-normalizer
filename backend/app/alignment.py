@@ -13,6 +13,8 @@ GOOD_INLIERS = 40
 GOOD_INLIER_RATIO = 0.2
 GOOD_COVERAGE = 0.3
 MAX_RMS = 3.0
+# RANSAC tolerance for wrinkled blankets, as a fraction of the working image diagonal.
+WRINKLE_TOLERANCE = 0.025
 GRID = 6
 
 
@@ -70,11 +72,14 @@ def align_auto(
     ref_exclude: np.ndarray | None = None,
     src_exclude: np.ndarray | None = None,
     region: tuple[float, float, float, float] | None = None,
+    wrinkle_correction: bool = False,
 ) -> AlignmentResult:
     """Estimate a homography between working copies; masks mark pixels to ignore (e.g. the baby).
 
     `region` is the reference-work-space rectangle used for spatial coverage (normally the blanket).
+    With `wrinkle_correction`, residual error the wrinkle step will remove is not flagged.
     """
+    max_rms = WRINKLE_TOLERANCE * np.hypot(*ref_gray.shape[:2]) / 2 if wrinkle_correction else MAX_RMS
 
     def failed(reason: str, **kw) -> AlignmentResult:
         return AlignmentResult(None, Alignment(quality="failed", reasons=[reason], **kw))
@@ -97,7 +102,21 @@ def align_auto(
 
     src_pts = np.float32([ks[s].pt for s, _ in pairs])
     ref_pts = np.float32([kr[r].pt for _, r in pairs])
+    rh, rw = ref_gray.shape[:2]
+    region = region or (0, 0, rw, rh)
     h, mask = cv2.findHomography(src_pts, ref_pts, cv2.USAC_MAGSAC, 4.0, maxIters=10000, confidence=0.9995)
+    threshold = 4.0
+    if h is not None and mask is not None:
+        inl0 = mask.ravel().astype(bool)
+        weak = inl0.sum() < GOOD_INLIER_RATIO * len(pairs) or _coverage(ref_pts[inl0], region) < GOOD_COVERAGE
+    else:
+        weak = True
+    if weak or wrinkle_correction:
+        # Wrinkled blankets displace features by more than a flat-plane tolerance allows.
+        loose = WRINKLE_TOLERANCE * np.hypot(rw, rh)
+        h2, mask2 = cv2.findHomography(src_pts, ref_pts, cv2.USAC_MAGSAC, loose, maxIters=10000, confidence=0.9995)
+        if h2 is not None and mask2 is not None and (mask is None or mask2.sum() > 1.3 * mask.sum()):
+            h, mask, threshold = h2, mask2, loose
     if h is None or mask is None:
         return failed("No consistent perspective transform was found")
     inl = mask.ravel().astype(bool)
@@ -114,15 +133,14 @@ def align_auto(
 
     err = np.linalg.norm(project_points(h, src_pts[inl]) - ref_pts[inl], axis=1)
     rms = float(np.sqrt(np.mean(err**2)))
-    rh, rw = ref_gray.shape[:2]
-    coverage = _coverage(ref_pts[inl], region or (0, 0, rw, rh))
+    coverage = _coverage(ref_pts[inl], region)
     ratio = n_inl / len(pairs)
 
     # Repeating prints can produce a second, different plausible transform.
     ambiguous = False
     rest = ~inl
     if rest.sum() >= MIN_INLIERS:
-        h2, mask2 = cv2.findHomography(src_pts[rest], ref_pts[rest], cv2.USAC_MAGSAC, 4.0, maxIters=5000)
+        h2, mask2 = cv2.findHomography(src_pts[rest], ref_pts[rest], cv2.USAC_MAGSAC, threshold, maxIters=5000)
         if h2 is not None and mask2 is not None and int(mask2.sum()) >= max(MIN_INLIERS, 0.4 * n_inl):
             sh, sw = src_gray.shape[:2]
             c = [[0, 0], [sw, 0], [sw, sh], [0, sh]]
@@ -136,7 +154,7 @@ def align_auto(
         reasons.append("Most feature matches were inconsistent")
     if coverage < GOOD_COVERAGE:
         reasons.append("Matches cover only part of the blanket")
-    if rms > MAX_RMS:
+    if rms > max_rms:
         reasons.append(f"High residual error ({rms:.1f}px)")
     if ambiguous:
         reasons.append("Repeating pattern allows another alignment")

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
+import cv2
 import numpy as np
 from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -12,11 +13,11 @@ from pydantic import BaseModel, Field
 
 from . import config
 from .exporter import ExportBlocked, build_zip, readiness
-from .geometry import analysis_view, default_output_width, output_view
+from .geometry import analysis_view, default_output_width, estimate_aspect, has_frame, output_view
 from .imageio import InvalidImageError, decode_gray_bytes, encode_jpeg, encode_png, write_bytes_atomic
 from .jobs import JobManager
 from .masks import propose_blanket
-from .pipeline import Pipeline, crop_for_polygon, set_reference
+from .pipeline import Pipeline, crop_for_polygon, set_quad_from_polygon, set_reference
 from .render import Renderer, donor_color, provenance_overlay
 from .storage import Landmark, NotFoundError, Project, ProjectStore, Rect, dump
 
@@ -84,7 +85,12 @@ def _project_json(project: Project) -> dict:
             "width": av.width,
             "height": av.height,
         }
-    data["default_output_width"] = default_output_width(project) if project.crop else None
+    data["default_output_width"] = default_output_width(project) if has_frame(project) else None
+    data["estimated_aspect"] = (
+        round(estimate_aspect(np.array(project.blanket_quad), (ref.width, ref.height) if ref else None), 4)
+        if project.blanket_quad
+        else None
+    )
     data["processing"] = state.jobs.is_active(project.id)
     return data
 
@@ -99,6 +105,10 @@ class UpdateProject(BaseModel):
     crop: Rect | None = None
     output_width: int | None = Field(default=None, ge=16, le=config.MAX_OUTPUT_WIDTH)
     blanket_polygon: list[tuple[float, float]] | None = None
+    perspective: bool | None = None
+    blanket_quad: list[tuple[float, float]] | None = None
+    blanket_aspect: float | None = Field(default=None, gt=0.1, lt=10)
+    wrinkles: Literal["off", "straighten", "clean"] | None = None
 
 
 @app.get("/api/health")
@@ -129,6 +139,10 @@ def update_project(project_id: str, body: UpdateProject):
     fields = body.model_fields_set
     if "blanket_polygon" in fields and body.blanket_polygon is not None and len(body.blanket_polygon) < 3:
         raise HTTPException(422, "The blanket boundary needs at least 3 points")
+    if "blanket_quad" in fields and body.blanket_quad is not None:
+        quad = np.array(body.blanket_quad, dtype=np.float32)
+        if len(quad) != 4 or not cv2.isContourConvex(quad.reshape(-1, 1, 2)) or abs(cv2.contourArea(quad)) < 1:
+            raise HTTPException(422, "The blanket corners must form a convex four-sided shape")
 
     def fn(p: Project):
         if "name" in fields and body.name:
@@ -141,10 +155,30 @@ def update_project(project_id: str, body: UpdateProject):
             p.blanket_polygon = body.blanket_polygon
             for ph in p.photos:
                 ph.approved = False
+        if "perspective" in fields and body.perspective is not None:
+            p.perspective = body.perspective
+        if "blanket_quad" in fields:
+            p.blanket_quad = body.blanket_quad
+            if body.blanket_quad is None:
+                # Null means "fit the corners to the blanket outline again".
+                set_quad_from_polygon(p)
+        if "blanket_aspect" in fields:
+            p.blanket_aspect = body.blanket_aspect
+        if "wrinkles" in fields and body.wrinkles is not None and body.wrinkles != p.wrinkles:
+            retolerance = (p.wrinkles == "off") != (body.wrinkles == "off")
+            p.wrinkles = body.wrinkles
+            # Alignment tolerances depend on whether wrinkles will be corrected.
+            for ph in p.photos:
+                if retolerance and ph.homography is not None and not ph.landmarks:
+                    ph.status = "pending"
 
+    before = _project(project_id).wrinkles
     project = state.store.mutate(project_id, fn)
-    if "blanket_polygon" in fields and project.reference:
+    if project.reference and ("blanket_polygon" in fields or project.wrinkles != before):
+        state.renderer.invalidate()
         state.jobs.request(project_id)
+    elif fields & {"perspective", "blanket_quad", "blanket_aspect", "crop", "output_width"}:
+        state.renderer.invalidate()
     return _project_json(project)
 
 
@@ -196,6 +230,7 @@ def auto_blanket(project_id: str):
     def fn(p: Project):
         p.blanket_polygon = poly
         p.crop = crop_for_polygon(poly)
+        set_quad_from_polygon(p)
         for ph in p.photos:
             ph.approved = False
 
@@ -254,6 +289,7 @@ def delete_photo(project_id: str, photo_id: str):
         state.store.work_path(project_id, photo_id),
         state.store.thumb_path(project_id, photo_id),
         state.store.mask_path(project_id, photo_id),
+        state.store.flow_path(project_id, photo_id),
     ):
         path.unlink(missing_ok=True)
     state.renderer.invalidate()
@@ -264,6 +300,8 @@ def delete_photo(project_id: str, photo_id: str):
 def set_reference_clear(p: Project):
     p.crop = None
     p.blanket_polygon = None
+    p.blanket_quad = None
+    p.blanket_aspect = None
     p.output_width = None
 
 
@@ -350,7 +388,7 @@ def _view(project: Project, view: ViewName, width: int | None):
         raise HTTPException(409, "Choose a reference photo first")
     if view == "analysis":
         return analysis_view(project.reference)
-    if project.crop is None:
+    if not has_frame(project):
         raise HTTPException(409, "Set the crop first")
     return output_view(project, min(width or config.PREVIEW_WIDTH, 2400))
 

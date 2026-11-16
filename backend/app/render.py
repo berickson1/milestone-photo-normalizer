@@ -1,18 +1,22 @@
 """Rendering normalized photos, including donor-based blanket reconstruction."""
 
+import tempfile
 import threading
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from . import color
+from .deform import flow_view, load_field, warp_deformed
 from .geometry import View, analysis_view, homography, project_points, scale_matrix, source_corners
 from .imageio import load_rgb, read_gray_file, read_rgb_file
 from .storage import Photo, Project, ProjectStore
 
-NONE, TARGET = -2, -1
+NONE, TARGET, PLATE = -2, -1, -3
 
 
 class LRU:
@@ -100,11 +104,15 @@ class Renderer:
         self._work = LRU(64)
         self._full = LRU(4)
         self._orders = LRU(256)
+        self._fields = LRU(64)
+        self._plates = LRU(3)
 
     def invalidate(self, project_id: str | None = None):
         self._work.clear()
         self._full.clear()
         self._orders.clear()
+        self._fields.clear()
+        self._plates.clear()
 
     # ---- sources -------------------------------------------------------
     def source(self, project: Project, photo: Photo, full: bool) -> tuple[np.ndarray, float]:
@@ -135,19 +143,80 @@ class Renderer:
             out = cv2.dilate(out.astype(np.uint8), _kernel(round(dilate_frac * view.width))) > 0
         return out
 
-    def warped(self, project: Project, photo: Photo, view: View, full: bool, apply_color: bool = True):
+    def warped(self, project: Project, photo: Photo, view: View, full: bool, apply_color: bool = True, deform: bool = True):
         h = homography(photo)
         if h is None:
             raise ValueError(f"Photo {photo.original_name} is not aligned")
         img, s = self.source(project, photo, full)
-        m = view.matrix @ h @ np.linalg.inv(scale_matrix(s))
-        out = warp(img, m, view)
-        valid = warp(np.full(img.shape[:2], 255, np.uint8), m, view, cv2.INTER_NEAREST)
+        disp = self.wrinkle_field(project, photo) if deform else None
+        if disp is not None:
+            out, valid = warp_deformed(img, h, s, view, flow_view(project.reference), disp)
+        else:
+            m = view.matrix @ h @ np.linalg.inv(scale_matrix(s))
+            out = warp(img, m, view)
+            valid = warp(np.full(img.shape[:2], 255, np.uint8), m, view, cv2.INTER_NEAREST)
         # Trim interpolation fringe at the photo's edges.
         valid = cv2.erode(valid, _kernel(max(1, round(view.width / 800)))) > 0
         if apply_color:
             out = color.apply_gains(out, color.effective_gains(photo.color))
         return out, valid
+
+    def wrinkle_field(self, project: Project, photo: Photo) -> np.ndarray | None:
+        """Wrinkle displacement field for the photo, when wrinkle correction is on and current."""
+        if project.wrinkles == "off" or project.reference is None or photo.homography is None:
+            return None
+        path = self.store.flow_path(project.id, photo.id)
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        key = (project.id, photo.id, stamp)
+        hit = self._fields.get(key)
+        if hit is None:
+            hit = (load_field(path, homography(photo)),)
+            self._fields.put(key, hit)
+        return hit[0]
+
+    # ---- clean composite -------------------------------------------------
+    def clean_plate(self, project: Project, view: View, full: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Per-pixel median of the blanket across all trusted photos, ignoring babies and props.
+
+        Crease shadows and wrinkles vary between photos, so the median shows a clean blanket.
+        Returns (image, valid). Warped photos are spilled to a temporary memmap to bound memory.
+        """
+        key = (project.id, project.revision, view.matrix.tobytes(), view.width, view.height, full)
+        hit = self._plates.get(key)
+        if hit is not None:
+            return hit
+        photos = [p for p in project.photos if p.homography is not None and p.alignment is not None and (p.alignment.quality == "ok" or p.approved or p.id == project.reference_id)]
+        shape = (view.height, view.width)
+        plate = np.zeros(shape + (3,), np.uint8)
+        plate_valid = np.zeros(shape, bool)
+        if photos:
+            blanket = blanket_mask(project, view)
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                stack = np.lib.format.open_memmap(Path(tmp) / "stack.npy", mode="w+", dtype=np.uint8, shape=(len(photos),) + shape + (4,))
+                for i, p in enumerate(photos):
+                    img, valid = self.warped(project, p, view, full)
+                    usable = valid & blanket & ~self.foreground(project, p, view, 0.012)
+                    stack[i, ..., :3] = img
+                    stack[i, ..., 3] = usable
+                rows = max(8, int(4_000_000 // max(1, view.width * len(photos))))
+                for y0 in range(0, shape[0], rows):
+                    chunk = np.array(stack[:, y0 : y0 + rows])  # copy so no view keeps the file mapped
+                    use = chunk[..., 3] > 0
+                    vals = chunk[..., :3].astype(np.float32)
+                    vals[~use] = np.nan
+                    any_use = use.any(axis=0)
+                    with np.errstate(all="ignore"), warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        med = np.nanmedian(vals, axis=0)
+                    plate[y0 : y0 + rows][any_use] = np.round(med[any_use]).astype(np.uint8)
+                    plate_valid[y0 : y0 + rows] = any_use
+                del stack
+        result = (plate, plate_valid)
+        self._plates.put(key, result)
+        return result
 
     # ---- donor selection ------------------------------------------------
     def donor_order(self, project: Project, target: Photo) -> list[Photo]:
@@ -214,6 +283,23 @@ class Renderer:
         prov[own] = TARGET
         remaining = blanket & ~valid
         donors_used: list[str] = []
+
+        if project.wrinkles == "clean" and reconstruct:
+            plate, plate_valid = self.clean_plate(project, view, full)
+            area = blanket & plate_valid
+            if area.any():
+                # Keep the target's own pixels on and just around the baby/props, feathered into the plate.
+                keep = self.foreground(project, target, view, 0.012).astype(np.float32)
+                if keep.any():
+                    feather = max(1.0, 0.006 * view.width)
+                    keep = np.maximum(keep, cv2.GaussianBlur(keep, (0, 0), feather))
+                    keep = np.clip(keep * 1.6, 0, 1)
+                w_plate = np.where(valid, 1.0 - keep, 1.0)[area][:, None]
+                result[area] = np.round(result[area] * (1 - w_plate) + plate[area] * w_plate).astype(np.uint8)
+                plate_px = np.zeros_like(area)
+                plate_px[area] = w_plate[:, 0] >= 0.5
+                prov[plate_px] = PLATE
+                remaining &= ~plate_valid
 
         if reconstruct and remaining.any():
             fg_t = self.foreground(project, target, view)

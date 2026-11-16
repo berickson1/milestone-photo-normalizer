@@ -10,6 +10,11 @@ DIFF_THRESHOLD = 28.0
 NCC_THRESHOLD = 0.5
 SMOOTH_VAR = 25.0
 WINDOW = 11
+SUPPORT_FRACTION = 0.6
+SUPPORT_WINDOW = 9
+# Shading-tolerant comparison (crease shadows): chromaticity within a plausible brightness ratio.
+CHROMA_THRESHOLD = 0.02
+MAX_SHADE_RATIO = 2.5
 
 
 def propose_blanket(ref_rgb: np.ndarray, ref_scale: float) -> list[tuple[float, float]]:
@@ -45,6 +50,7 @@ def detect_foreground(
     images: list[np.ndarray],
     valids: list[np.ndarray],
     blanket: np.ndarray,
+    shading_tolerant: bool = False,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """Flag pixels where an aligned photo is not part of the dominant agreeing group.
 
@@ -54,6 +60,9 @@ def detect_foreground(
     dominant group. Ties between groups flag everyone (conservative). Pixels covered by fewer
     than two photos carry no evidence and stay unflagged; users review masks before export.
 
+    With `shading_tolerant`, brightness changes that keep chromaticity (crease shadows) are not
+    treated as objects.
+
     Returns one boolean mask per image and the combined background (RGB).
     """
     n = len(images)
@@ -62,6 +71,12 @@ def detect_foreground(
     valid = np.stack(valids)
     count = valid.sum(axis=0)
     win = (WINDOW, WINDOW)
+    shades: list[tuple[np.ndarray, np.ndarray]] = []
+    if shading_tolerant:
+        for im in images:
+            rgb = cv2.GaussianBlur(im, (5, 5), 0).astype(np.float32) + 1.0
+            total = rgb.sum(axis=2)
+            shades.append((rgb / total[..., None], total))
     stats = []
     for lab in labs:
         g = lab[:, :, 0]
@@ -82,16 +97,26 @@ def detect_foreground(
             ncc = cov / np.sqrt(vari * varj + 1e-3)
             smooth = (vari < SMOOTH_VAR) & (varj < SMOOTH_VAR)
             agree = both & close & ((ncc > NCC_THRESHOLD) | smooth)
+            if shading_tolerant:
+                # Shadows scale brightness but keep chromaticity, however sharp the crease is.
+                (ci, ti), (cj, tj) = shades[i], shades[j]
+                ratio = ti / tj
+                shaded = (np.linalg.norm(ci - cj, axis=2) < CHROMA_THRESHOLD) & (ratio < MAX_SHADE_RATIO) & (ratio > 1 / MAX_SHADE_RATIO)
+                agree |= both & shaded
             support[i] += agree
             support[j] += agree
 
     support[~valid] = -1
+    # Pairwise tests are noisy per pixel; average support locally before comparing photos.
+    support = np.stack([np.where(valid[i], cv2.blur(np.maximum(support[i], 0).astype(np.float32), (SUPPORT_WINDOW, SUPPORT_WINDOW)), -1.0) for i in range(n)])
     best = support.max(axis=0)
-    at_best = (support == best).sum(axis=0)
-    # A single agreeing group of size k gives each member support k-1; more members means rival groups.
-    tie = at_best > best + 1
+    members = (support >= SUPPORT_FRACTION * best).sum(axis=0)
+    # One agreeing group of size k gives its members support up to k-1; far more members means rival groups.
+    tie = members > 1.5 * (best + 1)
     evidence = (count >= 2)[None] & valid
-    raw_fg = evidence & ((support < best[None]) | (best[None] <= 0) | tie[None])
+    # Real photos agree noisily (lighting, residual wrinkles), so members of the dominant group only
+    # need a clear share of the best support; objects have near-zero support.
+    raw_fg = evidence & ((support < SUPPORT_FRACTION * best[None]) | (best[None] <= 0) | tie[None])
 
     bg_sum = np.zeros((h, w, 3), np.float64)
     bg_n = np.zeros((h, w), np.float64)

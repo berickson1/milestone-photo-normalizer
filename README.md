@@ -11,8 +11,18 @@ Photos never leave your machine. The originals are stored byte-for-byte and neve
 1. **Photos:** upload the set. The first photo becomes the reference; change it to the one with the flattest, most
    complete view of the blanket. Each photo is aligned automatically (SIFT features + MAGSAC homography), and
    uncertain alignments are flagged for review.
-2. **Blanket & crop:** the blanket outline and crop are proposed automatically. Drag the corners to fix them, and set
-   the output width if you want something other than the default.
+2. **Blanket & crop:** the blanket outline and its four corners are proposed automatically. Drag them to fix them,
+   and set the output width if you want something other than the default.
+   - **Straighten perspective** (on by default) stretches the four corners into a true rectangle, removing camera
+     skew. The blanket's real width ÷ height is estimated from the reference photo; type the real value if you know
+     it. Turn it off to use a plain rectangular crop of the reference view instead.
+   - **Wrinkles:**
+     - *Leave as photographed:* only the flat (homography) alignment.
+     - *Straighten the pattern:* each photo is also warped smoothly (optical flow, excluding the baby) so the printed
+       pattern lines up with the average shape of all photos. Wrinkles that differ between photos flatten out.
+     - *Clean composite:* the blanket is rebuilt from a per-pixel median of all straightened photos, which removes
+       creases and their shadows. Only the baby and props come from each photo. This needs good baby masks; check
+       them on the Review tab.
 3. **Review:** for each photo:
    - **Result:** the final image. "Highlight rebuilt areas" tints each region by the photo it came from and hatches
      anything with no usable source.
@@ -79,8 +89,9 @@ and export end to end.
 
 ## Limitations
 
-- The blanket is treated as flat. Strong wrinkles or folds can't be unwarped, so features near them may not line up
-  exactly.
+- Wrinkle straightening corrects smooth distortions only. Sharp folds, and wrinkles under the baby, are
+  interpolated from the surrounding blanket. The clean composite can show a soft patch where a photo's baby mask is
+  too generous (that photo's own blanket is kept there).
 - Baby detection compares photos against each other. It needs at least two photos covering a spot, and it can miss
   parts of the baby that look like the blanket. Check the masks for photos that donate rebuilt areas.
 - Anything outside the blanket outline is blacked out, including parts of the baby that extend past the blanket.

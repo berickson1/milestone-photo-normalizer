@@ -85,6 +85,11 @@ class Project(BaseModel):
     crop: Rect | None = None
     output_width: int | None = None
     blanket_polygon: list[tuple[float, float]] | None = None
+    # Perspective correction: blanket corners (TL, TR, BR, BL) in reference space map to a rectangle.
+    perspective: bool = True
+    blanket_quad: list[tuple[float, float]] | None = None
+    blanket_aspect: float | None = Field(default=None, gt=0)
+    wrinkles: Literal["off", "straighten", "clean"] = "off"
     photos: list[Photo] = Field(default_factory=list)
     job: Job = Field(default_factory=Job)
 
@@ -137,6 +142,9 @@ class ProjectStore:
 
     def mask_path(self, project_id: str, photo_id: str) -> Path:
         return self.project_dir(project_id) / "masks" / f"{photo_id}.png"
+
+    def flow_path(self, project_id: str, photo_id: str) -> Path:
+        return self.project_dir(project_id) / "flows" / f"{photo_id}.npz"
 
     def background_path(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "background.jpg"

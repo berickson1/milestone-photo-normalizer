@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 from . import config
-from .geometry import output_view
+from .geometry import has_frame, output_view
 from .imageio import encode_png
 from .render import LRU, Renderer
 from .storage import Project
@@ -41,11 +41,11 @@ def readiness(renderer: Renderer, project: Project) -> dict:
         issues.append(_issue("no_reference", "Choose a reference photo"))
     if not project.blanket_polygon:
         issues.append(_issue("no_blanket", "Define the blanket boundary"))
-    if project.crop is None:
+    if not has_frame(project):
         issues.append(_issue("no_crop", "Set the shared crop"))
 
     photos = []
-    can_render = project.crop is not None and bool(project.blanket_polygon)
+    can_render = has_frame(project) and bool(project.blanket_polygon)
     view = output_view(project, config.PREVIEW_WIDTH) if can_render else None
     for ph in project.photos:
         p_issues, stats = [], None

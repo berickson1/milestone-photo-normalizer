@@ -9,14 +9,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import alignment, color, config, masks
-from .geometry import analysis_view, homography, scale_matrix
+from . import alignment, color, config, deform, masks
+from .geometry import analysis_view, estimate_aspect, homography, quad_from_polygon, scale_matrix
 from .imageio import encode_jpeg, encode_png, load_rgb, resize_max, write_bytes_atomic
 from .render import Renderer, blanket_mask
 from .storage import Alignment, Photo, Project, ProjectStore, Rect, new_id, sha256_file
 
 log = logging.getLogger(__name__)
 Progress = Callable[[int, int, str], None]
+FIELD_FG_DILATE = 0.03  # foreground margin kept out of the wrinkle-flow evidence, as a fraction of width
 
 
 class ProcessingAborted(Exception):
@@ -139,7 +140,14 @@ class Pipeline:
             pts = np.array(project.blanket_polygon) * ref.work_scale
             region = (*pts.min(axis=0), *pts.max(axis=0))
         return alignment.align_auto(
-            self._work_gray(project, ref), self._work_gray(project, photo), ref.work_scale, photo.work_scale, ref_ex, src_ex, region
+            self._work_gray(project, ref),
+            self._work_gray(project, photo),
+            ref.work_scale,
+            photo.work_scale,
+            ref_ex,
+            src_ex,
+            region,
+            wrinkle_correction=project.wrinkles != "off",
         )
 
     def _exclusion_in_source(self, project: Project, photo: Photo) -> np.ndarray | None:
@@ -171,13 +179,55 @@ class Pipeline:
                     p.crop = crop_for_polygon(poly)
 
             project = self.store.mutate(project_id, set_blanket)
+        if not project.blanket_quad and project.blanket_polygon:
+            project = self.store.mutate(project_id, set_quad_from_polygon)
 
         self._estimate_colors(project_id, use_masks=False)
         self._detect_foreground(project_id)
         if realign:
             self._realign_with_masks(project_id)
             self._detect_foreground(project_id)
+        if self.store.get(project_id).wrinkles != "off":
+            self._compute_fields(project_id)
+            self._detect_foreground(project_id)
+            self._compute_fields(project_id, exclude_foreground=True)
+            self._detect_foreground(project_id)
         self._estimate_colors(project_id, use_masks=True)
+
+    def _compute_fields(self, project_id: str, exclude_foreground: bool = False) -> None:
+        """Wrinkle displacement fields onto the photos' mean geometry (see deform.py).
+
+        With exclude_foreground, the (dilated) foreground masks are left out of the flow evidence so
+        the field over the baby is interpolated from the surrounding blanket instead of following it.
+        """
+        project = self.store.get(project_id)
+        ref = project.reference
+        photos = self._aligned_photos(project)
+        if ref is None or ref.homography is None or len(photos) < 2:
+            return
+        fview = deform.flow_view(ref)
+        blanket = blanket_mask(project, fview)
+        grays, oks = {}, {}
+        for p in photos:
+            img, valid = self.renderer.warped(project, p, fview, full=False, apply_color=False, deform=False)
+            grays[p.id] = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            # On the first pass foreground masks are unreliable; the flow's photometric check rejects most of the baby.
+            oks[p.id] = valid & blanket
+            if exclude_foreground:
+                oks[p.id] &= ~self.renderer.foreground(project, p, fview, FIELD_FG_DILATE)
+        fields = []
+        for p in photos:
+            if p.id == ref.id:
+                fields.append(np.zeros((fview.height, fview.width, 2), np.float32))
+                continue
+            fields.append(deform.pairwise_flow(grays[ref.id], grays[p.id], oks[ref.id] & oks[p.id]))
+        for p, d in zip(photos, deform.group_fields(fields)):
+            path = self.store.flow_path(project_id, p.id)
+            if d is None:
+                path.unlink(missing_ok=True)
+            else:
+                deform.save_field(path, d, np.array(p.homography))
+        self.store.mutate(project_id, lambda p: None)
 
     def _aligned_photos(self, project: Project) -> list[Photo]:
         return [p for p in project.photos if p.homography is not None]
@@ -196,7 +246,7 @@ class Pipeline:
             img, valid = self.renderer.warped(project, p, view, full=False)
             imgs.append(img)
             valids.append(valid)
-        fg, background = masks.detect_foreground(imgs, valids, blanket_mask(project, view))
+        fg, background = masks.detect_foreground(imgs, valids, blanket_mask(project, view), shading_tolerant=project.wrinkles == "clean")
         av = analysis_view(project.reference)
         bg_full = cv2.resize(background, (av.width, av.height), interpolation=cv2.INTER_LINEAR)
         write_bytes_atomic(self.store.background_path(project_id), encode_jpeg(bg_full, 90))
@@ -267,11 +317,22 @@ def crop_for_polygon(poly) -> Rect:
     return Rect(x=float(x0), y=float(y0), w=float(max(1.0, x1 - x0)), h=float(max(1.0, y1 - y0)))
 
 
+def set_quad_from_polygon(project: Project) -> None:
+    if not project.blanket_polygon:
+        return
+    project.blanket_quad = quad_from_polygon(project.blanket_polygon)
+    ref = project.reference
+    size = (ref.width, ref.height) if ref else None
+    project.blanket_aspect = round(estimate_aspect(np.array(project.blanket_quad), size), 4)
+
+
 def set_reference(store: ProjectStore, project: Project, photo_id: str) -> None:
     """Switch the reference; everything defined in reference space must be rebuilt."""
     project.reference_id = photo_id
     project.crop = None
     project.blanket_polygon = None
+    project.blanket_quad = None
+    project.blanket_aspect = None
     project.output_width = None
     for ph in project.photos:
         ph.homography = None
@@ -284,4 +345,5 @@ def set_reference(store: ProjectStore, project: Project, photo_id: str) -> None:
         ph.status = "pending"
         ph.error = None
         store.mask_path(project.id, ph.id).unlink(missing_ok=True)
+        store.flow_path(project.id, ph.id).unlink(missing_ok=True)
     store.background_path(project.id).unlink(missing_ok=True)
