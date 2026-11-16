@@ -94,8 +94,9 @@ def decode_gray_bytes(data: bytes) -> np.ndarray:
         raise InvalidImageError("cannot decode mask")
     if img.ndim == 3:
         if img.shape[2] == 4:
-            # Painted masks may carry their information in the alpha channel.
-            img = np.maximum(img[:, :, 3], cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY))
+            # Composite over black so both opaque black/white masks and alpha-painted masks work.
+            gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.uint16)
+            img = (gray * img[:, :, 3] // 255).astype(np.uint8)
         else:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img

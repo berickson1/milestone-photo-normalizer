@@ -161,7 +161,9 @@ def test_mask_edit_resets_approval_and_persists(client):
     a = project["analysis"]
     mask = np.zeros((a["height"], a["width"]), np.uint8)
     mask[10:50, 10:50] = 255
-    ok, buf = cv2.imencode(".png", mask)
+    # Browsers export canvas masks as opaque RGBA PNGs.
+    rgba = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGRA)
+    ok, buf = cv2.imencode(".png", rgba)
     r = client.put(f"/api/projects/{pid}/photos/{ph}/mask.png", content=buf.tobytes())
     assert r.status_code == 200
     project = wait_idle(client, pid)
