@@ -89,6 +89,69 @@ def _kernel(radius: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
 
 
+SEAM_FLOW_WIDTH = 1000  # working width for seam alignment
+SEAM_MAX_SHIFT = 0.025  # largest local correction, as a fraction of output width
+
+
+def seam_flow(donor: np.ndarray, target: np.ndarray, samples: np.ndarray, max_shift: float) -> np.ndarray | None:
+    """Smooth displacement field (h, w, 2) so that donor(x + flow(x)) lines up with target(x).
+
+    Measured by optical flow where both images show blanket (`samples`), kept only where forward
+    and backward flow agree on textured print, then extended smoothly over the rest.
+    """
+    h, w = samples.shape
+    s = min(1.0, SEAM_FLOW_WIDTH / w)
+    size = (max(8, round(w * s)), max(8, round(h * s)))
+    gray = [cv2.resize(cv2.cvtColor(im, cv2.COLOR_RGB2GRAY), size, interpolation=cv2.INTER_AREA) for im in (target, donor)]
+    smp = cv2.resize(samples.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+    smp = cv2.erode(smp.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    if np.count_nonzero(smp) < 200:
+        return None
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    fwd = dis.calc(gray[0], gray[1], None)
+    bwd = dis.calc(gray[1], gray[0], None)
+    gx, gy = np.meshgrid(np.arange(size[0], dtype=np.float32), np.arange(size[1], dtype=np.float32))
+    back = cv2.remap(bwd, gx + fwd[..., 0], gy + fwd[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    consistent = np.linalg.norm(fwd + back, axis=2) < 1.0
+    g = gray[0].astype(np.float32)
+    mu = cv2.blur(g, (7, 7))
+    textured = cv2.blur(g * g, (7, 7)) - mu * mu > 16.0
+    conf = smp & consistent & textured
+    if np.count_nonzero(conf) < 100:
+        return None
+    k = min(1.0, 200 / size[0])
+    small = (max(4, round(size[0] * k)), max(4, round(size[1] * k)))
+    wts = cv2.resize(conf.astype(np.float32), small, interpolation=cv2.INTER_AREA)
+    vals = cv2.resize(fwd * conf[..., None], small, interpolation=cv2.INTER_AREA) / np.maximum(wts, 1e-6)[..., None]
+    flow = color.fill_sparse(vals, np.where(wts > 0.05, wts, 0).astype(np.float32))
+    flow = cv2.GaussianBlur(flow, (0, 0), max(1.0, 0.01 * small[0])).reshape(small[1], small[0], 2)
+    flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / s
+    limit = max_shift * w
+    mag = np.linalg.norm(flow, axis=2, keepdims=True)
+    return (flow * np.minimum(1.0, limit / np.maximum(mag, 1e-6))).astype(np.float32)
+
+
+def align_donor(
+    d_img: np.ndarray, usable: np.ndarray, result: np.ndarray, resolved: np.ndarray, samples: np.ndarray, region: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Locally warp a donor within `region` so its print continues the result across the seam."""
+    ys, xs = np.nonzero(region)
+    if not len(ys):
+        return d_img, usable
+    crop = (slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1))
+    # Show the donor inside the hole so flow isn't pulled by the hole's black edge.
+    target = np.where(resolved[crop][..., None], result[crop], d_img[crop])
+    flow = seam_flow(d_img[crop], target, samples[crop], SEAM_MAX_SHIFT * region.shape[1] / (xs.max() - xs.min() + 1))
+    if flow is None:
+        return d_img, usable
+    gx, gy = np.meshgrid(np.arange(crop[1].start, crop[1].stop, dtype=np.float32), np.arange(crop[0].start, crop[0].stop, dtype=np.float32))
+    mx, my = gx + flow[..., 0], gy + flow[..., 1]
+    d_img, usable = d_img.copy(), usable.copy()
+    d_img[crop] = cv2.remap(d_img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    usable[crop] = cv2.remap(usable.astype(np.uint8), mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    return d_img, usable
+
+
 def donor_eligible(photo: Photo, target_id: str) -> bool:
     return (
         photo.id != target_id
@@ -314,11 +377,23 @@ class Renderer:
                 take = remaining & usable
                 if not take.any():
                     continue
-                # Local color match against the target's surrounding blanket.
-                overlap = ring & usable
-                local = color.estimate_gains(d_img, result, overlap, 0.8, 1.25, 50) if overlap.any() else None
-                if local is not None:
-                    d_img = color.apply_gains(d_img, local)
+                near = cv2.dilate(take.astype(np.uint8), _kernel(round(0.025 * view.width))) > 0
+                resolved = prov != NONE
+                d_img, usable = align_donor(d_img, usable, result, resolved, near & resolved & ~fg_t & usable, near)
+                take = remaining & usable
+                if not take.any():
+                    continue
+                # Match the donor's local brightness and contrast to the surrounding result along
+                # the seam, so lighting gradients and haze don't leave a visible step.
+                samples = near & resolved & ~fg_t & usable
+                matched = color.seam_transfer(d_img, usable, result, samples, cv2.dilate(take.astype(np.uint8), _kernel(feather + 1)) > 0)
+                if matched is not None:
+                    d_img = matched
+                else:
+                    overlap = ring & usable
+                    local = color.estimate_gains(d_img, result, overlap, 0.8, 1.25, 50) if overlap.any() else None
+                    if local is not None:
+                        d_img = color.apply_gains(d_img, local)
                 idx = len(donors_used)
                 donors_used.append(donor.id)
                 result[take] = d_img[take]
