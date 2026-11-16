@@ -123,6 +123,23 @@ def test_full_workflow(client, tmp_path):
     after = client.get(f"/api/projects/{pid}/photos/{partial_id}/render.jpg").content
     assert before == after
 
+    # Renaming and reordering change export names and order, but not the renders.
+    ids = [p.id for p in project_model.photos]
+    new_order = ids[::-1]
+    assert client.put(f"/api/projects/{pid}/photos/order", json={"photo_ids": new_order[:-1]}).status_code == 409
+    r = client.put(f"/api/projects/{pid}/photos/order", json={"photo_ids": new_order})
+    assert [p["id"] for p in r.json()["photos"]] == new_order
+    client.patch(f"/api/projects/{pid}/photos/{partial_id}", json={"name": "  Month 1: partial / blanket  "})
+    client.patch(f"/api/projects/{pid}/photos/{ref_id}", json={"name": "temp"})
+    r = client.patch(f"/api/projects/{pid}/photos/{ref_id}", json={"name": ""})
+    names = {p["id"]: p["name"] for p in r.json()["photos"]}
+    assert names[partial_id] == "Month 1: partial / blanket" and names[ref_id] is None
+    zf = zipfile.ZipFile(io.BytesIO(client.get(f"/api/projects/{pid}/export.zip").content))
+    pngs = sorted(n for n in zf.namelist() if n.endswith(".png"))
+    assert pngs[0] == "001_Month_1_partial_blanket.png" and pngs[-1] == "005_ref.png"
+    assert "original=partial.jpg" in zf.read("README.txt").decode()
+    assert client.get(f"/api/projects/{pid}/photos/{partial_id}/render.jpg").content == before
+
 
 def test_unresolved_blanket_blocks_until_accepted(client):
     pid = client.post("/api/projects", json={"name": "Two"}).json()["id"]

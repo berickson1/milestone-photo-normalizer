@@ -306,6 +306,7 @@ def set_reference_clear(p: Project):
 
 
 class UpdatePhoto(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
     color_enabled: bool | None = None
     color_strength: float | None = Field(default=None, ge=0, le=1)
     approved: bool | None = None
@@ -318,6 +319,9 @@ def update_photo(project_id: str, photo_id: str, body: UpdatePhoto):
 
     def fn(p: Project):
         ph = p.photo(photo_id)
+        if "name" in body.model_fields_set:
+            # Blank or null clears the label back to the original filename.
+            ph.name = (body.name or "").strip() or None
         if body.color_enabled is not None:
             ph.color.enabled = body.color_enabled
         if body.color_strength is not None:
@@ -330,6 +334,23 @@ def update_photo(project_id: str, photo_id: str, body: UpdatePhoto):
             ph.accept_unresolved = body.accept_unresolved
 
     return _project_json(state.store.mutate(project_id, fn))
+
+
+class PhotoOrder(BaseModel):
+    photo_ids: list[str]
+
+
+@app.put("/api/projects/{project_id}/photos/order")
+def reorder_photos(project_id: str, body: PhotoOrder):
+    """Set the display and export order. The list must name every photo exactly once."""
+
+    def fn(p: Project):
+        by_id = {ph.id: ph for ph in p.photos}
+        if len(body.photo_ids) != len(by_id) or set(body.photo_ids) != set(by_id):
+            raise HTTPException(409, "The photo list changed; reload and try again")
+        p.photos = [by_id[i] for i in body.photo_ids]
+
+    return _project_json(state.store.mutate(_project(project_id).id, fn))
 
 
 class Landmarks(BaseModel):

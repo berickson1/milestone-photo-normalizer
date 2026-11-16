@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, urls, type Photo, type Readiness, type Stats } from "../api";
+import { api, photoLabel, urls, type Photo, type Readiness, type Stats } from "../api";
 import type { Ctx } from "./ProjectPage";
 import { qualityBadge } from "./PhotosTab";
 import MaskEditor from "./MaskEditor";
@@ -42,7 +42,7 @@ export default function ReviewTab(ctx: Ctx) {
             <button key={ph.id} className={`side-item ${ph.id === photo.id ? "active" : ""}`} onClick={() => setSelected(ph.id)}>
               <img src={urls.thumb(project, ph.id)} alt="" />
               <span>
-                <span className="name">{ph.original_name}</span>
+                <span className="name">{photoLabel(ph)}</span>
                 <span className="row">
                   {qualityBadge(ph, ph.id === project.reference_id)}
                   {issues.length > 0 && <span className="badge warn">{issues.length} to fix</span>}
@@ -57,7 +57,7 @@ export default function ReviewTab(ctx: Ctx) {
           <button onClick={() => go(-1)} aria-label="Previous photo">
             ←
           </button>
-          <strong className="name">{photo.original_name}</strong>
+          <strong className="name">{photoLabel(photo)}</strong>
           <button onClick={() => go(1)} aria-label="Next photo">
             →
           </button>

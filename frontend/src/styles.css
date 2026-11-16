@@ -255,6 +255,31 @@ input[type="range"] {
 .card.is-ref {
   border-color: var(--accent);
 }
+.card[draggable="true"] {
+  cursor: grab;
+}
+.card.dragging {
+  opacity: 0.4;
+}
+.card.drop-before {
+  box-shadow: -4px 0 0 var(--accent);
+}
+.card.drop-after {
+  box-shadow: 4px 0 0 var(--accent);
+}
+.name-edit {
+  all: unset;
+  cursor: text;
+  display: block;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.name-edit:hover,
+.name-edit:focus-visible {
+  text-decoration: underline dotted;
+}
 .card img {
   width: 100%;
   aspect-ratio: 4 / 3;

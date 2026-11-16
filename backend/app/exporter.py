@@ -67,7 +67,7 @@ def readiness(renderer: Renderer, project: Project) -> dict:
                     p_issues.append(_issue("unresolved", msg))
         if ph.color.enabled and ph.color.gains is None and ph.homography is not None and ph.id != project.reference_id:
             p_issues.append(_issue("color_skipped", "Too little shared blanket to match color; left unchanged", blocking=False))
-        photos.append({"photo_id": ph.id, "name": ph.original_name, "issues": p_issues, "stats": stats})
+        photos.append({"photo_id": ph.id, "name": ph.name or ph.original_name, "issues": p_issues, "stats": stats})
 
     ready = not any(i["blocking"] for i in issues) and not any(i["blocking"] for p in photos for i in p["issues"])
     result = {"ready": ready, "issues": issues, "photos": photos, "revision": project.revision}
@@ -76,7 +76,12 @@ def readiness(renderer: Renderer, project: Project) -> dict:
 
 
 def _safe_stem(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).stem)[:60] or "photo"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")[:60] or "photo"
+
+
+def export_name(index: int, ph) -> str:
+    label = ph.name or Path(ph.original_name).stem
+    return f"{index:03d}_{_safe_stem(label)}.png"
 
 
 def build_zip(renderer: Renderer, project: Project) -> Path:
@@ -90,7 +95,7 @@ def build_zip(renderer: Renderer, project: Project) -> Path:
         with open(fd, "wb") as f, zipfile.ZipFile(f, "w", compression=zipfile.ZIP_STORED) as zf:
             for i, ph in enumerate(project.photos, start=1):
                 r = renderer.render(project, ph.id, view, full=True)
-                zf.writestr(f"{i:03d}_{_safe_stem(ph.original_name)}.png", encode_png(r.image))
+                zf.writestr(export_name(i, ph), encode_png(r.image))
             zf.writestr("README.txt", _manifest(project, view.width, view.height))
     except BaseException:
         path.unlink(missing_ok=True)
@@ -102,5 +107,5 @@ def _manifest(project: Project, w: int, h: int) -> str:
     buf = io.StringIO()
     buf.write(f"{project.name}\nOutput size: {w}x{h}\nReference: {project.reference.original_name}\n\n")
     for i, ph in enumerate(project.photos, start=1):
-        buf.write(f"{i:03d}  {ph.original_name}  sha256={ph.sha256}\n")
+        buf.write(f"{export_name(i, ph)}  original={ph.original_name}  sha256={ph.sha256}\n")
     return buf.getvalue()

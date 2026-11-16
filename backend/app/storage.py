@@ -51,6 +51,7 @@ class ColorSettings(BaseModel):
 class Photo(BaseModel):
     id: str
     original_name: str
+    name: str | None = None  # user-chosen label; falls back to the original filename
     stored_name: str
     sha256: str
     width: int

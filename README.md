@@ -10,7 +10,8 @@ Photos never leave your machine. The originals are stored byte-for-byte and neve
 
 1. **Photos:** upload the set. The first photo becomes the reference; change it to the one with the flattest, most
    complete view of the blanket. Each photo is aligned automatically (SIFT features + MAGSAC homography), and
-   uncertain alignments are flagged for review.
+   uncertain alignments are flagged for review. Click a photo's name to rename it (e.g. "Month 3"), and drag photos
+   (or use ◀ ▶, or **Sort by name**) to set their order.
 2. **Blanket & crop:** the blanket outline and its four corners are proposed automatically. Drag them to fix them,
    and set the output width if you want something other than the default.
    - **Straighten perspective** (on by default) stretches the four corners into a true rectangle, removing camera
@@ -34,7 +35,8 @@ Photos never leave your machine. The originals are stored byte-for-byte and neve
    - **Colour:** turn colour matching on or off, or reduce its strength.
    - **Sign-off:** photos with uncertain alignment or rebuilt areas must be marked as reviewed before export. If part of
      the blanket appears in no photo, accept leaving it black.
-4. **Export:** download a ZIP of same-size PNGs, in upload order, plus a `README.txt` with checksums.
+4. **Export:** download a ZIP of same-size PNGs in your chosen order, named `001_<name>.png` and so on, plus a
+   `README.txt` listing each original filename and checksum.
 
 Rebuilt areas only ever use real pixels from your other photos, warped into place and colour-matched locally. Nothing
 is generated or invented.

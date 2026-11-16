@@ -18,6 +18,7 @@ export type Landmark = { ref: Pt; src: Pt };
 export type Photo = {
   id: string;
   original_name: string;
+  name: string | null;
   width: number;
   height: number;
   work_scale: number;
@@ -31,6 +32,9 @@ export type Photo = {
   approved: boolean;
   accept_unresolved: boolean;
 };
+
+/** The user's label for a photo, or its original filename. */
+export const photoLabel = (ph: Pick<Photo, "name" | "original_name">) => ph.name || ph.original_name;
 
 export type Wrinkles = "off" | "straighten" | "clean";
 
@@ -126,8 +130,9 @@ export const api = {
   updatePhoto: (
     id: string,
     pid: string,
-    body: { color_enabled?: boolean; color_strength?: number; approved?: boolean; accept_unresolved?: boolean },
+    body: { name?: string | null; color_enabled?: boolean; color_strength?: number; approved?: boolean; accept_unresolved?: boolean },
   ) => request<Project>("PATCH", PH(id, pid), body),
+  reorderPhotos: (id: string, photo_ids: string[]) => request<Project>("PUT", `${P(id)}/photos/order`, { photo_ids }),
   setLandmarks: (id: string, pid: string, landmarks: Landmark[]) =>
     request<Project>("PUT", `${PH(id, pid)}/landmarks`, { landmarks }),
   putMask: (id: string, pid: string, png: Blob) => request<Project>("PUT", `${PH(id, pid)}/mask.png`, png),
