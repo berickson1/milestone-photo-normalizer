@@ -1,5 +1,8 @@
 """Automatic proposals for the blanket boundary and per-photo foreground (baby, markers, props)."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
 
@@ -12,6 +15,8 @@ SMOOTH_VAR = 25.0
 WINDOW = 11
 SUPPORT_FRACTION = 0.6
 SUPPORT_WINDOW = 9
+SHIFT_RADIUS = 0.008  # residual misalignment tolerated when comparing photos, as a fraction of width
+DENSE_SHIFT_RADIUS = 0.0015  # same, once wrinkle correction has aligned photos densely
 # Shading-tolerant comparison (crease shadows): chromaticity within a plausible brightness ratio.
 CHROMA_THRESHOLD = 0.02
 MAX_SHADE_RATIO = 2.5
@@ -51,6 +56,7 @@ def detect_foreground(
     valids: list[np.ndarray],
     blanket: np.ndarray,
     shading_tolerant: bool = False,
+    shift_radius: float = SHIFT_RADIUS,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """Flag pixels where an aligned photo is not part of the dominant agreeing group.
 
@@ -63,11 +69,44 @@ def detect_foreground(
     With `shading_tolerant`, brightness changes that keep chromaticity (crease shadows) are not
     treated as objects.
 
+    Photos are compared with up to `shift_radius` (fraction of width) of residual misalignment,
+    so textured blanket that is a few pixels off still agrees.
+
     Returns one boolean mask per image and the combined background (RGB).
     """
+    h, w = images[0].shape[:2]
+    # Only pixels near the blanket can be flagged; skip the rest of the frame.
+    dil = max(3, round(0.02 * w))
+    zone = cv2.dilate(blanket.astype(np.uint8), np.ones((dil * 2 + 1, dil * 2 + 1), np.uint8)) > 0
+    if not zone.any():
+        zone = np.ones((h, w), bool)
+    ys, xs = np.nonzero(zone)
+    radius = max(1, round(shift_radius * w))
+    pad = dil + WINDOW + SUPPORT_WINDOW + radius
+    crop = (slice(max(0, ys.min() - pad), min(h, ys.max() + pad + 1)), slice(max(0, xs.min() - pad), min(w, xs.max() + pad + 1)))
+    masks_c, bg_c = _detect(
+        [im[crop] for im in images], [v[crop] for v in valids], zone[crop], shading_tolerant, radius, h * w, dil
+    )
+    bg_sum = np.zeros((h, w, 3), np.float64)
+    bg_n = np.zeros((h, w), np.float64)
+    for im, v in zip(images, valids):
+        bg_sum[v] += im[v]
+        bg_n[v] += 1
+    background = (bg_sum / np.maximum(bg_n, 1)[:, :, None]).astype(np.uint8)
+    background[crop] = bg_c
+    masks = []
+    for m in masks_c:
+        full = np.zeros((h, w), bool)
+        full[crop] = m
+        masks.append(full)
+    return masks, background
+
+
+def _detect(images, valids, zone, shading_tolerant, radius, full_area, dil):
     n = len(images)
     h, w = images[0].shape[:2]
     labs = [cv2.GaussianBlur(cv2.cvtColor(im, cv2.COLOR_RGB2LAB), (5, 5), 0).astype(np.float32) for im in images]
+    planes = [[np.ascontiguousarray(lab[:, :, k]) for k in range(3)] for lab in labs]
     valid = np.stack(valids)
     count = valid.sum(axis=0)
     win = (WINDOW, WINDOW)
@@ -76,35 +115,68 @@ def detect_foreground(
         for im in images:
             rgb = cv2.GaussianBlur(im, (5, 5), 0).astype(np.float32) + 1.0
             total = rgb.sum(axis=2)
-            shades.append((rgb / total[..., None], total))
+            chroma = rgb / total[..., None]
+            shades.append(([np.ascontiguousarray(chroma[:, :, k]) for k in range(3)], total))
     stats = []
     for lab in labs:
-        g = lab[:, :, 0]
+        g = np.ascontiguousarray(lab[:, :, 0])
         mu = cv2.boxFilter(g, -1, win)
         var = np.maximum(cv2.boxFilter(g * g, -1, win) - mu * mu, 0)
-        stats.append((g, mu, var))
+        stats.append((g, mu, np.sqrt(var + 1e-3) * np.sqrt(NCC_THRESHOLD), var < SMOOTH_VAR))
 
-    support = np.zeros((n, h, w), np.int16)
-    for i in range(n):
-        gi, mui, vari = stats[i]
-        for j in range(i + 1, n):
-            both = valid[i] & valid[j]
+    # Real blankets are never perfectly flat, so a homography leaves the print a few pixels off between
+    # photos. Pixels agree when they match anywhere within a small neighbourhood of each other.
+    step = max(1, radius // 2)
+    offsets = [(dy, dx) for dy in range(-radius, radius + 1, step) for dx in range(-radius, radius + 1, step)]
+    max_dist2 = DIFF_THRESHOLD**2
+    max_chroma2 = CHROMA_THRESHOLD**2
+
+    def sq_dist(pa, pb, si, sj):
+        out = None
+        for a, b in zip(pa, pb):
+            d = a[si] - b[sj]
+            np.multiply(d, d, out=d)
+            out = d if out is None else np.add(out, d, out=out)
+        return out
+
+    def compare(i: int, j: int):
+        gi, mui, sdi, smi = stats[i]
+        gj, muj, sdj, smj = stats[j]
+        agree_i = np.zeros((h, w), bool)
+        agree_j = np.zeros((h, w), bool)
+        for dy, dx in offsets:
+            # Compare pixel p of photo i with pixel p + (dy, dx) of photo j, over the overlapping slices.
+            si = (slice(max(0, -dy), h - max(0, dy)), slice(max(0, -dx), w - max(0, dx)))
+            sj = (slice(max(0, dy), h - max(0, -dy)), slice(max(0, dx), w - max(0, -dx)))
+            both = valid[i][si] & valid[j][sj]
             if not both.any():
                 continue
-            gj, muj, varj = stats[j]
-            close = np.linalg.norm(labs[i] - labs[j], axis=2) < DIFF_THRESHOLD
-            cov = cv2.boxFilter(gi * gj, -1, win) - mui * muj
-            ncc = cov / np.sqrt(vari * varj + 1e-3)
-            smooth = (vari < SMOOTH_VAR) & (varj < SMOOTH_VAR)
-            agree = both & close & ((ncc > NCC_THRESHOLD) | smooth)
-            if shading_tolerant:
+            cov = cv2.boxFilter(gi[si] * gj[sj], -1, win)
+            cov -= mui[si] * muj[sj]
+            # ncc > NCC_THRESHOLD, with sd already scaled by sqrt(NCC_THRESHOLD).
+            structure = cov > sdi[si] * sdj[sj]
+            if dy == 0 and dx == 0:
+                # Smooth areas aren't sensitive to misalignment; shifting them would let plain objects
+                # match any nearby plain blanket.
+                structure |= smi[si] & smj[sj]
+            agree = both & (sq_dist(planes[i], planes[j], si, sj) < max_dist2) & structure
+            if shading_tolerant and dy == 0 and dx == 0:
                 # Shadows scale brightness but keep chromaticity, however sharp the crease is.
                 (ci, ti), (cj, tj) = shades[i], shades[j]
-                ratio = ti / tj
-                shaded = (np.linalg.norm(ci - cj, axis=2) < CHROMA_THRESHOLD) & (ratio < MAX_SHADE_RATIO) & (ratio > 1 / MAX_SHADE_RATIO)
+                ratio = ti[si] / tj[sj]
+                shaded = (sq_dist(ci, cj, si, sj) < max_chroma2) & (ratio < MAX_SHADE_RATIO) & (ratio > 1 / MAX_SHADE_RATIO)
                 agree |= both & shaded
-            support[i] += agree
-            support[j] += agree
+            agree_i[si] |= agree
+            agree_j[sj] |= agree
+        return i, j, agree_i, agree_j
+
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n) if (valid[i] & valid[j]).any()]
+    support = np.zeros((n, h, w), np.int16)
+    # NumPy and OpenCV release the GIL, so photo pairs run in parallel.
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+        for i, j, agree_i, agree_j in pool.map(lambda ij: compare(*ij), pairs):
+            support[i] += agree_i
+            support[j] += agree_j
 
     support[~valid] = -1
     # Pairwise tests are noisy per pixel; average support locally before comparing photos.
@@ -127,9 +199,7 @@ def detect_foreground(
     background = (bg_sum / np.maximum(bg_n, 1)[:, :, None]).astype(np.uint8)
 
     masks = []
-    min_area = MIN_COMPONENT_FRACTION * h * w
-    dil = max(3, round(0.02 * w))
-    zone = cv2.dilate(blanket.astype(np.uint8), np.ones((dil * 2 + 1, dil * 2 + 1), np.uint8)) > 0
+    min_area = MIN_COMPONENT_FRACTION * full_area
     for i in range(n):
         m = (raw_fg[i] & zone).astype(np.uint8)
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))

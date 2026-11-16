@@ -246,7 +246,13 @@ class Pipeline:
             img, valid = self.renderer.warped(project, p, view, full=False)
             imgs.append(img)
             valids.append(valid)
-        fg, background = masks.detect_foreground(imgs, valids, blanket_mask(project, view), shading_tolerant=project.wrinkles == "clean")
+        fg, background = masks.detect_foreground(
+            imgs,
+            valids,
+            blanket_mask(project, view),
+            shading_tolerant=project.wrinkles == "clean",
+            shift_radius=masks.DENSE_SHIFT_RADIUS if project.wrinkles != "off" else masks.SHIFT_RADIUS,
+        )
         av = analysis_view(project.reference)
         bg_full = cv2.resize(background, (av.width, av.height), interpolation=cv2.INTER_LINEAR)
         write_bytes_atomic(self.store.background_path(project_id), encode_jpeg(bg_full, 90))
